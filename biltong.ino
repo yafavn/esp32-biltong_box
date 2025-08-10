@@ -3,6 +3,7 @@
     - Buttons publish states to MQTT and accept set commands from MQTT
     - LCD updated with system/heater/mode states
     - No persistent storage of states after power off (as requested)
+    - one more comment for GIT test
 */
 
 #include <WiFi.h>
