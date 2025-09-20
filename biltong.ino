@@ -83,14 +83,14 @@ const char* topicLedBrightnessSet = "biltong/led_brightness/set";
 
 // ================= Hardware pins (all const) =================
 const int PIN_DHT           = 4;  // DHT data pin
-const int PIN_TACH          = 5;  // tach input (interrupt)
-const int PIN_PWM_FAN       = 16; // PWM pin for main fan
+const int PIN_TACH          = 5;  // tach input (interrupt) - fun RPM - green wire
+const int PIN_PWM_FAN       = 16; // PWM pin for main fan - blue wire
 const int PIN_HEATER        = 27; // Heater MOSFET control pin (placeholder)
 const int PIN_HEATER_FAN    = 26; // Heater fan MOSFET control pin (placeholder)
 // const int PIN_PWM_LED       = 17; // FUTURE: PWM pin for LED MOSFET control
 
 // Buttons
-const int BTN_SYS_PIN       = 13; // green - master power
+const int BTN_SYS_PIN       = 13; // green - master power - green wire
 const int BTN_HEATER_PIN    = 33; // red   - manual heater on/off
 const int BTN_MODE_PIN      = 32; // yellow - auto/manual
 
@@ -115,7 +115,7 @@ WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
 
 // New: configuration flags for hardware presence
-const bool HEATER_HW_PRESENT = false; // Set to true when heater MOSFET arrives
+const bool HEATER_HW_PRESENT = true; // Set to true when heater MOSFET arrives
 
 // New: Target temperature/humidity for auto-control
 float tempMin = 20.0; // Tmin from HA
@@ -528,8 +528,8 @@ void setupAll() {
   // Initialize heater pins (even if hardware not present)
   pinMode(PIN_HEATER, OUTPUT);
   pinMode(PIN_HEATER_FAN, OUTPUT);
-  digitalWrite(PIN_HEATER, LOW);
-  digitalWrite(PIN_HEATER_FAN, LOW);
+  digitalWrite(PIN_HEATER, HIGH); // שונה
+  digitalWrite(PIN_HEATER_FAN, HIGH); // שונה
   
   // Setup WiFi and MQTT
   setupWiFi();
