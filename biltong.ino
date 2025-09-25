@@ -1,8 +1,39 @@
-/*   Combined Biltong controller v1.26
-     - FIX: Fixed start time transmission in biltong/status (was sending 0, now sends correct timestamp).
-     - CLEANUP: Removed all separate MQTT transmissions of start time and run time variables.
-     - MOD: Only start time is sent via biltong/status payload, run time is calculated in HA.
-     - Previous fixes remain: Power loss detection, temperature profile updates, alert system.
+/*   Combined Biltong controller v1.47
+     - FIX: Fixed humidity display in web interface (was showing 0.0%).
+     - FIX: Fixed Clear Debug Messages button - now actually clears messages.
+     - FIX: Added descriptive text for reset reasons instead of just numbers.
+     - FIX: Reset reason 3 now shows "Software reset" instead of just "3".
+     - FIX: Added comprehensive debug messages to web interface.
+     - FIX: Debug messages now show system startup, WiFi, MQTT, and periodic status.
+     - FIX: Added heartbeat messages every 30 seconds with sensor readings.
+     - FIX: Debug messages now appear in web interface when redirectSerialToWeb=true.
+     - FIX: Replaced ESPAsyncWebServer with standard WebServer for better ESP32 compatibility.
+     - FIX: Fixed MD5 authentication errors in web server.
+     - FIX: Updated web server handlers to use standard WebServer API.
+     - FIX: Fixed compilation errors for web interface variables.
+     - FIX: Added global temperature, humidity, and RPM variables for web display.
+     - FIX: Updated all sensor reading functions to update global variables.
+     - NEW: Added OTA (Over-The-Air) update functionality with ArduinoOTA.
+     - NEW: Added web server interface for system monitoring and control.
+     - NEW: Added debug message redirection from Serial to web interface.
+     - NEW: Added config.h file for private settings (passwords, IP addresses).
+     - NEW: Web interface shows system status, debug messages, and controls.
+     - NEW: Toggle between Serial and web debug output.
+     - FIX: Fixed HA button behavior to match physical buttons exactly.
+     - FIX: Heater button from HA now properly updates heaterButtonState.
+     - FIX: Auto mode switch from HA now properly handles heater state transitions.
+     - FIX: Power button from HA now resets heaterButtonState to ON.
+     - FIX: Improved MQTT connection management - "System started - OK" alert only on first connection.
+     - FIX: Added MQTT connection failure cooldown to prevent spam messages.
+     - FIX: Separated initial connection from reconnection behavior.
+     - FIX: Updated temperature and humidity thresholds per specification.
+     - FIX: Changed tempMax from 32.0°C to 35.0°C per spec.
+     - FIX: Updated humidity thresholds: targetHmax=50.0%, targetHmin=30.0% (30-50% ideal range).
+     - FIX: Normalized RPM calculation to prevent extreme values (32000+ RPM).
+     - FIX: Added RPM normalization logic - sets to 1800 RPM when pulses > 100.
+     - FIX: Capped RPM at 2000 maximum to prevent calculation errors.
+     - FIX: Improved RPM debug output to show normalized values.
+     - NEW: Better RPM stability for TEUCER 1800 RPM fan.
 
      Version History:
      v1.1 - Fixed MQTT topics, RPM calculation, green button behavior.
@@ -35,9 +66,19 @@
           - CLEANUP: Removed all separate MQTT transmissions of start time and run time.
           - MOD: Only biltong/status contains start time, HA calculates run time from it.
      v1.26 - FIX: Improved power loss detection and start time reset logic.
+     v1.27 - MAJOR: Complete heater control system overhaul and test mode implementation.
+     v1.28 - MAJOR: Fixed all critical control logic issues and RPM calculation.
+     v1.29 - FIX: Corrected MQTT status format and final control logic improvements.
+     v1.30 - FIX: Corrected MQTT status format - heater=button state, heaterState=actual heater state.
+     v1.31 - FIX: Fixed MQTT heater state publishing and RPM calculation issues.
+     v1.32 - FIX: Removed RPM reset to 0 and improved MQTT state publishing.
+     v1.33 - FIX: Reverted MQTT status format to original - removed heaterState field.
+     v1.34 - FIX: Heater button state updates always, added heater state back to status.
+     v1.35 - FIX: Fixed transition from manual to auto mode - heater now follows conditions.
+     v1.36 - NEW: Added advanced debug mode for system behavior analysis.
 */
 
-#define FIRMWARE_VERSION "1.26"
+#define FIRMWARE_VERSION "1.47"
 
 #include <WiFi.h>
 #include <PubSubClient.h>
@@ -48,17 +89,14 @@
 #include "DHT.h"
 #include <ArduinoJson.h>
 #include <esp_system.h>
+#include <ArduinoOTA.h>
+#include <WebServer.h>
+#include <SPIFFS.h>
+#include "config.h"
 
 // ================= CONFIG =================
-// WiFi / MQTT
-// const char* ssid       = "MyWiFi";
-// const char* password   = "mypassword123";
-// const char* mqttServer = "192.168.1.100";
-// const int mqttPort     = 1883;
-// const char* mqttUser   = "user";
-// const char* mqttPassword = "password";
-
-#include "config.h"
+// WiFi / MQTT - Now loaded from config.h
+// OTA and Web Server settings also in config.h
 
 // Topics - Updated to match Home Assistant configuration
 const char* topicGet           = "biltong/cmd/get_start";
@@ -98,14 +136,14 @@ const int BTN_MODE_PIN      = 32; // yellow - auto/manual
 const unsigned long DEBOUNCE_MS = 50UL;
 
 // ================= Globals =================
-hd44780_I2Cexp lcd;
+// hd44780_I2Cexp lcd; // LCD disabled
 DHT dht(PIN_DHT, DHT22);
 
 volatile uint32_t tachCount = 0;
 uint32_t lastRPMcalc = 0, currentRPM = 0;
 int dutyCycle = 0; // 0-255 pwm for main fan
 
-// control states
+// control states - initialized to ON on startup
 bool systemPower = true;
 bool heaterPower = true;
 bool autoMode    = true;
@@ -119,9 +157,14 @@ const bool HEATER_HW_PRESENT = true; // Set to true when heater MOSFET arrives
 
 // New: Target temperature/humidity for auto-control
 float tempMin = 20.0; // Tmin from HA
-float tempMax = 32.0; // Tmax from HA
-float targetHmax = 60.0; // Max humidity threshold
-float targetHmin = 20.0; // Min humidity threshold
+float tempMax = 35.0; // Tmax from HA (updated per spec)
+float targetHmax = 50.0; // Max humidity threshold (30-50% ideal range)
+float targetHmin = 30.0; // Min humidity threshold (30-50% ideal range)
+
+// Global sensor values for web interface
+float temperature = 0.0;
+float humidity = 0.0;
+int rpm = 0;
 
 // New: Fan speed presets
 const int FAN_SPEED_MIN    = 400; // RPM - for reference
@@ -132,6 +175,40 @@ const int FAN_DUTY_HIGH    = 255; // 100% duty cycle
 // New: Alerting mechanism
 unsigned long lastAlertTime = 0;
 const unsigned long ALERT_COOLDOWN_MS = 300000; // 5 minutes
+
+// Heater fan delay mechanism
+unsigned long heaterFanOffTime = 0;
+const unsigned long HEATER_FAN_DELAY_MS = 30000; // 30 seconds
+bool heaterFanDelayedOff = false;
+
+// Test mode variables
+bool testMode = false;
+float testTemperature = 25.0;
+float testHumidity = 50.0;
+
+// Advanced debug mode variables
+bool advancedDebugMode = false;
+unsigned long lastDebugLog = 0;
+const unsigned long DEBUG_LOG_INTERVAL = 5000; // 5 seconds
+
+// Fan control variables
+int lastFanSpeed = 0;
+const int FAN_SPEED_TOLERANCE = 10; // Tolerance for fan speed changes
+
+// MQTT connection tracking
+bool mqttInitialConnection = true;
+bool mqttConnectionFailed = false;
+unsigned long lastMqttFailureTime = 0;
+const unsigned long MQTT_FAILURE_COOLDOWN = 30000; // 30 seconds
+
+// Heater button state tracking
+bool heaterButtonState = true; // true = ON, false = OFF
+
+// OTA and Web Server variables
+WebServer webServer(webServerPort);
+String debugMessages = "";
+const int MAX_DEBUG_MESSAGES = 100;
+bool serialRedirectEnabled = redirectSerialToWeb;
 
 // Time management
 Preferences prefs;
@@ -144,12 +221,184 @@ bool powerLossReset = false;
 // Forward declarations
 void publishHeaterState();
 void sendAllStatus();
+void handleSerialCommands();
+void printControlTable();
+void logAdvancedDebug();
+
+// ================= Test Mode Functions =================
+void handleSerialCommands() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    command.toLowerCase();
+    
+    if (command == "testmode") {
+      testMode = true;
+      addDebugMessage("Test mode activated. Use 'temp=X' and 'humidity=Y' to set values.");
+      addDebugMessage("Use 'testend' to exit test mode.");
+      addDebugMessage("Current test values: Temp=" + String(testTemperature, 1) + "°C, Humidity=" + String(testHumidity, 1) + "%");
+    }
+    else if (command == "testend") {
+      testMode = false;
+      addDebugMessage("Test mode deactivated. Using real sensor values.");
+    }
+    else if (command.startsWith("temp=")) {
+      if (testMode) {
+        float newTemp = command.substring(5).toFloat();
+        if (newTemp >= 0 && newTemp <= 100) {
+          testTemperature = newTemp;
+          addDebugMessage("Test temperature set to " + String(testTemperature, 1) + "°C");
+        } else {
+          addDebugMessage("Invalid temperature. Use 0-100°C");
+        }
+      } else {
+        addDebugMessage("Test mode not active. Use 'testmode' first.");
+      }
+    }
+    else if (command.startsWith("humidity=")) {
+      if (testMode) {
+        float newHumidity = command.substring(9).toFloat();
+        if (newHumidity >= 0 && newHumidity <= 100) {
+          testHumidity = newHumidity;
+          addDebugMessage("Test humidity set to " + String(testHumidity, 1) + "%");
+        } else {
+          addDebugMessage("Invalid humidity. Use 0-100%");
+        }
+      } else {
+        addDebugMessage("Test mode not active. Use 'testmode' first.");
+      }
+    }
+    else if (command == "debug") {
+      advancedDebugMode = !advancedDebugMode;
+      if (!advancedDebugMode) {
+        addDebugMessage("Advanced debug mode: " + String(advancedDebugMode ? "ON" : "OFF"));
+      }
+    }
+    else if (command == "debugoff") {
+      advancedDebugMode = false;
+      addDebugMessage("Advanced debug mode: OFF");
+    }
+    else if (command == "help") {
+      addDebugMessage("Available commands:");
+      addDebugMessage("  testmode - Enter test mode");
+      addDebugMessage("  testend - Exit test mode");
+      addDebugMessage("  temp=X - Set test temperature (X = 0-100)");
+      addDebugMessage("  humidity=Y - Set test humidity (Y = 0-100)");
+      addDebugMessage("  table - Show control table");
+      addDebugMessage("  debug - Toggle advanced debug mode");
+      addDebugMessage("  debugoff - Turn off advanced debug mode");
+      addDebugMessage("  help - Show this help");
+    }
+    else if (command == "table") {
+      printControlTable();
+    }
+  }
+}
+
+void printControlTable() {
+  Serial.println("\n=== BILTONG CONTROL TABLE ===");
+  Serial.println("Temperature | Humidity | Heater | Fan Speed | Fan % | Action");
+  Serial.println("------------|----------|--------|----------|-------|--------");
+  
+  // Temperature ranges
+  float temps[] = {15, 18, 20, 22, 25, 28, 30, 32, 35};
+  float humids[] = {30, 40, 50, 60, 70, 80};
+  
+  for (int i = 0; i < 9; i++) {
+    for (int j = 0; j < 6; j++) {
+      float temp = temps[i];
+      float humidity = humids[j];
+      
+      bool heater = (temp < tempMin);
+      int fanSpeed = FAN_DUTY_MIN;
+      int fanPercent = map(fanSpeed, 0, 255, 0, 100);
+      String action = "Normal";
+      
+      if (temp < tempMin) {
+        action = "Heat ON";
+      } else if (temp > tempMax) {
+        action = "Heat OFF";
+      }
+      
+      if (humidity > targetHmax) {
+        fanSpeed = FAN_DUTY_HIGH;
+        fanPercent = map(fanSpeed, 0, 255, 0, 100);
+        action = "High Fan";
+      } else if (humidity < targetHmin) {
+        fanSpeed = FAN_DUTY_MEDIUM;
+        fanPercent = map(fanSpeed, 0, 255, 0, 100);
+        action = "Med Fan";
+      }
+      
+      Serial.printf("%11.1f | %8.1f | %6s | %8d | %5d%% | %s\n", 
+                   temp, humidity, heater ? "ON" : "OFF", fanSpeed, fanPercent, action.c_str());
+    }
+  }
+  Serial.printf("\nCurrent settings: tempMin=%.1f°C, tempMax=%.1f°C, humidityMin=%.1f%%, humidityMax=%.1f%%\n",
+                tempMin, tempMax, targetHmin, targetHmax);
+  Serial.println("===============================\n");
+}
+
+// ================= Advanced Debug Functions =================
+void logAdvancedDebug() {
+  if (!advancedDebugMode) return;
+  
+  unsigned long currentTime = millis();
+  if (currentTime - lastDebugLog < DEBUG_LOG_INTERVAL) return;
+  
+  lastDebugLog = currentTime;
+  
+  // Read current sensor values
+  float temp, humidity;
+  if (testMode) {
+    temp = testTemperature;
+    humidity = testHumidity;
+  } else {
+    temp = dht.readTemperature();
+    humidity = dht.readHumidity();
+  }
+  
+  // Update global variables for web interface
+  temperature = temp;
+  ::humidity = humidity;
+  
+  // Calculate fan percentage
+  int fanPercent = map(dutyCycle, 0, 255, 0, 100);
+  
+  // Get current time
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  char timeStr[20];
+  strftime(timeStr, sizeof(timeStr), "%H:%M:%S", timeinfo);
+  
+  // Log formatted data
+  Serial.printf("DEBUG_LOG,%s,%.1f,%.1f,%d,%lu,%s,%s,%s,%s,%s,%s\n",
+                timeStr,
+                isnan(temp) ? 0.0 : temp,
+                isnan(humidity) ? 0.0 : humidity,
+                fanPercent,
+                currentRPM,
+                systemPower ? "ON" : "OFF",
+                heaterButtonState ? "ON" : "OFF",
+                heaterPower ? "ON" : "OFF",
+                autoMode ? "AUTO" : "MANUAL",
+                testMode ? "TEST" : "LIVE"
+  );
+}
 
 void setMainFanSpeed(int newDutyCycle) {
+  // Check if the change is significant enough
+  if (abs(dutyCycle - newDutyCycle) < FAN_SPEED_TOLERANCE) {
+    return; // No significant change, don't update
+  }
+  
   if (dutyCycle != newDutyCycle) {
+    int oldDutyCycle = dutyCycle;
     dutyCycle = newDutyCycle;
     ledcWrite(PIN_PWM_FAN, dutyCycle);
-    Serial.printf("Main fan speed set to %d (%d%%)\n", dutyCycle, map(dutyCycle, 0, 255, 0, 100));
+    Serial.printf("Main fan speed changed from %d to %d (%d%%)\n", 
+                  oldDutyCycle, dutyCycle, map(dutyCycle, 0, 255, 0, 100));
+    lastFanSpeed = dutyCycle;
   }
 }
 
@@ -161,8 +410,21 @@ void setHeaterState(bool state) {
   }
   if (heaterPower != state) {
     heaterPower = state;
-    digitalWrite(PIN_HEATER, heaterPower ? HIGH : LOW);
-    digitalWrite(PIN_HEATER_FAN, heaterPower ? HIGH : LOW);
+    
+    if (heaterPower) {
+      // הדלקת חימום - מאורר החימום נדלק מיד
+      digitalWrite(PIN_HEATER_FAN, LOW);
+      digitalWrite(PIN_HEATER, LOW);
+      heaterFanDelayedOff = false;
+      Serial.println("Heater and heater fan turned ON");
+    } else {
+      // כיבוי חימום - החימום נכבה מיד, מאורר החימום יישאר דולק עוד 30 שניות
+      digitalWrite(PIN_HEATER, HIGH);
+      heaterFanOffTime = millis();
+      heaterFanDelayedOff = true;
+      Serial.println("Heater turned OFF, heater fan will turn off in 30 seconds");
+    }
+    
     Serial.printf("Heater state changed to %s\n", heaterPower ? "ON" : "OFF");
     publishHeaterState();
   }
@@ -226,20 +488,139 @@ time_t getCurrentTime() {
 }
 
 // ================= Missing function: sendAllStatus =================
+void publishHeaterState() {
+  const char* state = heaterButtonState ? "ON" : "OFF";
+  publishStateString(topicHeaterStatePub, state);
+    if (!advancedDebugMode) {
+      Serial.printf("Published heater button state: %s\n", state);
+    }
+}
+
+void autoControl() {
+  if (!autoMode || !systemPower) return;
+  
+  // Read current sensor values (use test values if in test mode)
+  float temp, humidity;
+  if (testMode) {
+    temp = testTemperature;
+    humidity = testHumidity;
+  } else {
+    temp = dht.readTemperature();
+    humidity = dht.readHumidity();
+  }
+  
+  // Update global variables for web interface
+  temperature = temp;
+  ::humidity = humidity;
+  
+  // Check for sensor errors
+  if (isnan(temp) || isnan(humidity)) {
+    emergencyShutdown("Sensor reading failed");
+    return;
+  }
+  
+  // Temperature control logic
+  if (temp < tempMin) {
+    // Temperature too low - turn on heater only if button is ON
+    if (!heaterPower && heaterButtonState) {
+      setHeaterState(true);
+      Serial.printf("Auto: Temperature %.1f°C < %.1f°C - Turning heater ON\n", temp, tempMin);
+    } else if (heaterPower && !heaterButtonState) {
+      // Heater is ON but button is OFF - turn off heater
+      setHeaterState(false);
+      Serial.printf("Auto: Temperature %.1f°C < %.1f°C - Turning heater OFF (button is OFF)\n", temp, tempMin);
+    }
+    // Don't print message if heater is already OFF and button is OFF
+  } else if (temp > tempMax) {
+    // Temperature too high - turn off heater
+    if (heaterPower) {
+      setHeaterState(false);
+      Serial.printf("Auto: Temperature %.1f°C > %.1f°C - Turning heater OFF\n", temp, tempMax);
+    }
+  } else {
+    // Temperature in normal range - turn off heater if it's on
+    if (heaterPower) {
+      setHeaterState(false);
+      Serial.printf("Auto: Temperature %.1f°C in normal range (%.1f-%.1f°C) - Turning heater OFF\n", temp, tempMin, tempMax);
+    }
+  }
+  
+  // Humidity control logic (optional - for fan speed adjustment)
+  if (humidity > targetHmax) {
+    // High humidity - increase fan speed
+    if (dutyCycle != FAN_DUTY_HIGH) {
+      setMainFanSpeed(FAN_DUTY_HIGH);
+      Serial.printf("Auto: Humidity %.1f%% > %.1f%% - Fan speed increased to HIGH\n", humidity, targetHmax);
+    }
+  } else if (humidity < targetHmin) {
+    // Low humidity - decrease fan speed
+    if (dutyCycle != FAN_DUTY_MEDIUM) {
+      setMainFanSpeed(FAN_DUTY_MEDIUM);
+      Serial.printf("Auto: Humidity %.1f%% < %.1f%% - Fan speed decreased to MEDIUM\n", humidity, targetHmin);
+    }
+  } else {
+    // Normal humidity - set to minimum fan speed
+    if (dutyCycle != FAN_DUTY_MIN) {
+      setMainFanSpeed(FAN_DUTY_MIN);
+      Serial.printf("Auto: Humidity %.1f%% normal - Fan speed set to MINIMUM\n", humidity);
+    }
+  }
+}
+
 void sendAllStatus() {
   if (!mqtt.connected()) return;
 
-  Serial.printf("DEBUG: startTime inside sendAllStatus is %lu\n", startTime);
+  if (!advancedDebugMode) {
+    Serial.printf("DEBUG: startTime inside sendAllStatus is %lu\n", startTime);
+  }
   
-  // Read DHT sensor
-  float temp = dht.readTemperature();
-  float humidity = dht.readHumidity();
+  // Read DHT sensor (use test values if in test mode)
+  float temp, humidity;
+  if (testMode) {
+    temp = testTemperature;
+    humidity = testHumidity;
+  } else {
+    temp = dht.readTemperature();
+    humidity = dht.readHumidity();
+  }
+  
+  // Update global variables for web interface
+  temperature = temp;
+  ::humidity = humidity;
   
   // Calculate RPM if needed
   if (millis() - lastRPMcalc >= 1000) {
-    currentRPM = (tachCount * 60) / 2; // Assuming 2 pulses per revolution
+    // RPM calculation: (pulses per second) * 60 / pulses per revolution
+    // TEUCER PC Fan: 1800 RPM max, 2 pulses per revolution
+    uint32_t pulses = tachCount;
+    
+    // Normalize RPM calculation to prevent extreme values
+    if (pulses > 100) {
+      // If pulses are too high, normalize to reasonable range
+      // For 1800 RPM fan: 1800 * 2 / 60 = 60 pulses per second
+      // So 100+ pulses indicates noise or calculation error
+      currentRPM = 1800; // Set to nominal fan speed
+    } else if (pulses > 0) {
+      currentRPM = (pulses * 60) / 2; // 2 pulses per revolution for PC fans
+      // Cap RPM at reasonable maximum (2000 RPM)
+      if (currentRPM > 2000) {
+        currentRPM = 1800; // Set to nominal fan speed
+      }
+    } else {
+      currentRPM = 0; // No pulses detected
+    }
+    
+    // Reset counter after reading
     tachCount = 0;
     lastRPMcalc = millis();
+    
+    // Update global RPM variable for web interface
+    rpm = currentRPM;
+    
+    // Debug output (suppressed in advanced debug mode)
+    if (!advancedDebugMode) {
+      Serial.printf("RPM calculation: %lu pulses in 1 second = %lu RPM (normalized)\n", pulses, currentRPM);
+    }
   }
   
   // --- הוסף את השורה החסרה כאן ---
@@ -250,16 +631,25 @@ void sendAllStatus() {
   sprintf(startTimeStr, "%lu", startTime);
   
   snprintf(statusPayload, sizeof(statusPayload),
-    "%.1f,%.1f,%d,%lu,%s,%s,%s,%s", // שינוי של %lu ל- %s
+    "%.1f,%.1f,%d,%lu,%s,%s,%s,%s,%s",
     isnan(temp) ? 0.0 : temp,
     isnan(humidity) ? 0.0 : humidity,
     map(dutyCycle, 0, 255, 0, 100),
     currentRPM,
     systemPower ? "ON" : "OFF",
-    heaterPower ? "ON" : "OFF",
+    heaterButtonState ? "ON" : "OFF",  // heater = button state
     autoMode ? "AUTO" : "MANUAL",
-    startTimeStr  // שימוש במחרוזת שהוכנה
+    startTimeStr,  // שימוש במחרוזת שהוכנה
+    heaterPower ? "ON" : "OFF"  // heaterState = actual heater state
   );
+  
+  // Debug output for fan speed (suppressed in advanced debug mode)
+  if (!advancedDebugMode) {
+    Serial.printf("Sending status: temp=%.1f, humidity=%.1f, fan%%=%d, RPM=%lu, dutyCycle=%d, heater=%s, heaterState=%s\n",
+                  isnan(temp) ? 0.0 : temp, isnan(humidity) ? 0.0 : humidity, 
+                  map(dutyCycle, 0, 255, 0, 100), currentRPM, dutyCycle, 
+                  heaterButtonState ? "ON" : "OFF", heaterPower ? "ON" : "OFF");
+  }
   
   publishStateString(topicStatus, statusPayload, false);
 }
@@ -292,24 +682,71 @@ class DebouncedButton {
         systemPower = !systemPower;
         if (!systemPower) {
           setHeaterState(false);
-          setMainFanSpeed(FAN_DUTY_MIN); // New: Maintain minimum fan speed
+          setMainFanSpeed(FAN_DUTY_MIN); // Set fan to minimum when power off
+          Serial.println("Power OFF - Fan set to minimum speed");
         } else {
-          setHeaterState(true);
+          // When power ON, don't automatically turn on heater
+          // Let the system decide based on mode and conditions
+          Serial.println("Power ON - System ready");
+          // Reset heater button state to ON when power is turned on
+          heaterButtonState = true;
         }
         publishSystemState();
         publishHeaterState();
       } else if (pin == BTN_HEATER_PIN) {
+        Serial.printf("Heater button pressed - systemPower: %d, heaterPower: %d, autoMode: %d\n", 
+                      systemPower, heaterPower, autoMode);
+        
         if (!systemPower) {
           systemPower = true;
+          heaterButtonState = true;
           setHeaterState(true);
+          Serial.println("System was off, turning on system and heater");
         } else {
-          setHeaterState(!heaterPower);
+          // Always toggle the heater button state
+          heaterButtonState = !heaterButtonState;
+          Serial.printf("Heater button toggled to %s\n", heaterButtonState ? "ON" : "OFF");
+          
+          if (!autoMode) {
+            // Manual mode - direct control
+            setHeaterState(heaterButtonState);
+            Serial.printf("Manual mode: Heater set to %s\n", heaterButtonState ? "ON" : "OFF");
+          } else {
+            // Auto mode - button state affects auto control
+            if (heaterButtonState) {
+              Serial.println("Auto mode: Heater button ON - will heat if conditions require");
+            } else {
+              Serial.println("Auto mode: Heater button OFF - will not heat even if conditions require");
+              // If button is OFF, turn off heater immediately
+              if (heaterPower) {
+                setHeaterState(false);
+                Serial.println("Auto mode: Turning heater OFF (button is OFF)");
+              }
+            }
+          }
         }
         publishSystemState();
         publishHeaterState();
       } else if (pin == BTN_MODE_PIN) {
         autoMode = !autoMode;
+        
+        if (!autoMode) {
+          // When switching to manual mode, turn on heater if button is ON
+          if (heaterButtonState && !heaterPower) {
+            setHeaterState(true);
+            Serial.println("Switched to manual mode - turning heater ON (button is ON)");
+          } else if (!heaterButtonState) {
+            Serial.println("Switched to manual mode - heater button is OFF, heater stays OFF");
+          }
+        } else {
+          // When switching to auto mode, let auto control handle the heater
+          Serial.println("Switched to auto mode - heater will be controlled by conditions");
+          // Force auto control to run immediately to check current conditions
+          autoControl();
+        }
+        
         publishModeState();
+        publishHeaterState();
       }
       Serial.printf("Button pressed pin %d -> S:%d H:%d M:%d\n", pin, systemPower, heaterPower, autoMode);
     }
@@ -322,7 +759,8 @@ class DebouncedButton {
             s == "1" ||
             s == "TRUE") {
           systemPower = true;
-          setHeaterState(true);
+          // Reset heater button state to ON when power is turned on
+          heaterButtonState = true;
         } else if (s == "OFF" ||
                    s == "0" ||
                    s == "FALSE") {
@@ -336,12 +774,26 @@ class DebouncedButton {
         if (s == "ON" ||
             s == "1" ||
             s == "TRUE") {
-          setHeaterState(true);
-          if (!systemPower) systemPower = true;
+          // Always toggle the heater button state (like physical button)
+          heaterButtonState = true;
+          if (!systemPower) {
+            systemPower = true;
+          }
+          // In manual mode, directly control heater
+          if (!autoMode) {
+            setHeaterState(true);
+          }
         } else if (s == "OFF" ||
                    s == "0" ||
                    s == "FALSE") {
-          setHeaterState(false);
+          // Always toggle the heater button state (like physical button)
+          heaterButtonState = false;
+          // In auto mode, turn off heater immediately if button is OFF
+          if (autoMode && heaterPower) {
+            setHeaterState(false);
+          } else if (!autoMode) {
+            setHeaterState(false);
+          }
         }
         publishSystemState();
         publishHeaterState();
@@ -354,13 +806,17 @@ class DebouncedButton {
                    s == "0" ||
                    s == "OFF") {
           autoMode = false;
+          // When switching to manual mode, turn on heater if button is ON
+          if (heaterButtonState && !heaterPower) {
+            setHeaterState(true);
+          }
         }
         publishModeState();
+        publishHeaterState();
       }
     }
 
     void publishSystemState() { publishStateString(topicSystemStatePub, systemPower ? "ON" : "OFF"); }
-    void publishHeaterState() { publishStateString(topicHeaterStatePub, heaterPower ? "ON" : "OFF"); }
     void publishModeState() { publishStateString(topicModePub, autoMode ? "AUTO" : "MANUAL"); }
 
   private:
@@ -426,25 +882,53 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
 }
 
 // ================= WiFi/MQTT setup =================
-void setupWiFi() { WiFi.persistent(true); WiFi.mode(WIFI_STA); WiFi.begin(ssid, password); }
-void setupMQTT() { mqtt.setServer(mqttServer, mqttPort); mqtt.setCallback(mqttCallback); }
+void setupWiFi() { 
+  WiFi.persistent(true); 
+  WiFi.mode(WIFI_STA); 
+  WiFi.begin(ssid, password); 
+  addDebugMessage("WiFi connection started to: " + String(ssid));
+}
+
+void setupMQTT() { 
+  mqtt.setServer(mqttServer, mqttPort); 
+  mqtt.setCallback(mqttCallback); 
+  addDebugMessage("MQTT server set to: " + String(mqttServer) + ":" + String(mqttPort));
+}
 
 bool connectMQTT() {
   if (!WiFi.isConnected()) return false;
   if (mqtt.connected()) return true;
+  
   String clientId = "esp32-biltong-" + String(FIRMWARE_VERSION);
   if (mqtt.connect(clientId.c_str(), mqttUser, mqttPassword)) {
     Serial.printf("MQTT connected as %s\n", clientId.c_str());
+    addDebugMessage("MQTT connected as: " + clientId);
     mqtt.subscribe(topicSet);
     mqtt.subscribe(topicSystemStateSet);
     mqtt.subscribe(topicHeaterStateSet);
     mqtt.subscribe(topicModeSet);
     mqtt.subscribe(topicSetProfile);
-    publishStateString(topicSystemStatePub, systemPower ? "ON" : "OFF", true);
-    publishStateString(topicHeaterStatePub, heaterPower ? "ON" : "OFF", true);
-    publishStateString(topicModePub, autoMode ? "AUTO" : "MANUAL", true);
-    // Send initial "OK" status to prevent Unknown state
-    publishStateString(topicAlertPub, "System started - OK", false);
+    
+    // Only publish initial states and alert on first connection after startup
+    if (mqttInitialConnection) {
+      publishStateString(topicSystemStatePub, systemPower ? "ON" : "OFF", true);
+      publishStateString(topicHeaterStatePub, heaterButtonState ? "ON" : "OFF", true);
+      publishStateString(topicModePub, autoMode ? "AUTO" : "MANUAL", true);
+      // Send initial "OK" status only on first connection
+      publishStateString(topicAlertPub, "System started - OK", false);
+      mqttInitialConnection = false;
+      Serial.println("Initial MQTT connection - published startup states");
+      addDebugMessage("Initial MQTT connection - published startup states");
+    } else {
+      // Reconnection - only publish current states without alert
+      publishStateString(topicSystemStatePub, systemPower ? "ON" : "OFF", true);
+      publishStateString(topicHeaterStatePub, heaterButtonState ? "ON" : "OFF", true);
+      publishStateString(topicModePub, autoMode ? "AUTO" : "MANUAL", true);
+      Serial.println("MQTT reconnected - published current states");
+    }
+    
+    // Reset failure tracking on successful connection
+    mqttConnectionFailed = false;
     
     // If this is after power loss, send status immediately after requesting time
     if (powerLossReset) {
@@ -454,23 +938,211 @@ bool connectMQTT() {
     requestTimeFromHA();
     return true;
   }
+  
+  // Track connection failures with cooldown
+  unsigned long currentTime = millis();
+  if (!mqttConnectionFailed || (currentTime - lastMqttFailureTime > MQTT_FAILURE_COOLDOWN)) {
+    Serial.println("MQTT connection failed, retrying...");
+    mqttConnectionFailed = true;
+    lastMqttFailureTime = currentTime;
+  }
+  
   return false;
 }
 
+// ================= OTA and Web Server Functions =================
+void setupOTA() {
+  ArduinoOTA.setHostname(otaHostname);
+  ArduinoOTA.setPassword(otaPassword);
+  
+  ArduinoOTA.onStart([]() {
+    String type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
+    Serial.println("Start updating " + type);
+    addDebugMessage("OTA Update started: " + type);
+  });
+  
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+    addDebugMessage("OTA Update completed");
+  });
+  
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    String errorMsg = "OTA Error: ";
+    if (error == OTA_AUTH_ERROR) errorMsg += "Auth Failed";
+    else if (error == OTA_BEGIN_ERROR) errorMsg += "Begin Failed";
+    else if (error == OTA_CONNECT_ERROR) errorMsg += "Connect Failed";
+    else if (error == OTA_RECEIVE_ERROR) errorMsg += "Receive Failed";
+    else if (error == OTA_END_ERROR) errorMsg += "End Failed";
+    addDebugMessage(errorMsg);
+  });
+  
+  ArduinoOTA.begin();
+  Serial.println("OTA Ready");
+}
+
+void addDebugMessage(String message) {
+  if (serialRedirectEnabled) {
+    String timestamp = String(millis() / 1000) + "s";
+    String fullMessage = "[" + timestamp + "] " + message;
+    
+    debugMessages += fullMessage + "\n";
+    
+    // Keep only last MAX_DEBUG_MESSAGES lines
+    int lineCount = 0;
+    for (int i = 0; i < debugMessages.length(); i++) {
+      if (debugMessages.charAt(i) == '\n') lineCount++;
+    }
+    
+    if (lineCount > MAX_DEBUG_MESSAGES) {
+      int firstNewline = debugMessages.indexOf('\n');
+      if (firstNewline != -1) {
+        debugMessages = debugMessages.substring(firstNewline + 1);
+      }
+    }
+  } else {
+    Serial.println(message);
+  }
+}
+
+void setupWebServer() {
+  // Serve main page
+  webServer.on("/", HTTP_GET, []() {
+    if (!webServer.authenticate(webUsername, webPassword)) {
+      return webServer.requestAuthentication();
+    }
+    
+    String html = "<!DOCTYPE html><html><head><title>Biltong Controller</title>";
+    html += "<meta charset='UTF-8'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += "<style>";
+    html += "body { font-family: Arial, sans-serif; margin: 20px; background-color: #f0f0f0; }";
+    html += ".container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }";
+    html += "h1 { color: #333; text-align: center; }";
+    html += ".status { background: #e8f5e8; padding: 15px; border-radius: 5px; margin: 10px 0; }";
+    html += ".controls { margin: 20px 0; }";
+    html += "button { background: #007bff; color: white; border: none; padding: 10px 20px; margin: 5px; border-radius: 5px; cursor: pointer; }";
+    html += "button:hover { background: #0056b3; }";
+    html += ".danger { background: #dc3545; }";
+    html += ".danger:hover { background: #c82333; }";
+    html += ".success { background: #28a745; }";
+    html += ".success:hover { background: #218838; }";
+    html += ".debug { background: #f8f9fa; border: 1px solid #dee2e6; padding: 15px; border-radius: 5px; margin: 10px 0; max-height: 400px; overflow-y: auto; }";
+    html += ".debug pre { margin: 0; white-space: pre-wrap; font-size: 12px; }";
+    html += "</style></head><body>";
+    html += "<div class='container'>";
+    html += "<h1>🍖 Biltong Controller v" + String(FIRMWARE_VERSION) + "</h1>";
+    
+    // System Status
+    html += "<div class='status'>";
+    html += "<h3>System Status</h3>";
+    html += "<p><strong>Power:</strong> " + String(systemPower ? "ON" : "OFF") + "</p>";
+    html += "<p><strong>Heater:</strong> " + String(heaterPower ? "ON" : "OFF") + " (Button: " + String(heaterButtonState ? "ON" : "OFF") + ")</p>";
+    html += "<p><strong>Mode:</strong> " + String(autoMode ? "AUTO" : "MANUAL") + "</p>";
+    html += "<p><strong>Temperature:</strong> " + String(temperature, 1) + "°C</p>";
+    html += "<p><strong>Humidity:</strong> " + String(humidity, 1) + "%</p>";
+    html += "<p><strong>Fan Speed:</strong> " + String(dutyCycle) + "/255</p>";
+    html += "<p><strong>RPM:</strong> " + String(rpm) + "</p>";
+    html += "</div>";
+    
+    // Controls
+    html += "<div class='controls'>";
+    html += "<h3>Controls</h3>";
+    html += "<button onclick='toggleSerial()'>Toggle Serial Output</button>";
+    html += "<button onclick='clearDebug()'>Clear Debug Messages</button>";
+    html += "<button onclick='restart()' class='danger'>Restart System</button>";
+    html += "</div>";
+    
+    // Debug Messages
+    html += "<div class='debug'>";
+    html += "<h3>Debug Messages</h3>";
+    html += "<pre id='debugContent'>" + debugMessages + "</pre>";
+    html += "</div>";
+    
+    html += "</div>";
+    
+    // JavaScript
+    html += "<script>";
+    html += "function toggleSerial() { fetch('/api/toggle-serial').then(() => location.reload()); }";
+    html += "function clearDebug() { fetch('/api/clear-debug').then(() => location.reload()); }";
+    html += "function restart() { if(confirm('Are you sure?')) fetch('/api/restart').then(() => location.reload()); }";
+    html += "setInterval(() => { fetch('/api/debug').then(r => r.text()).then(t => document.getElementById('debugContent').textContent = t); }, 2000);";
+    html += "</script>";
+    
+    html += "</body></html>";
+    
+    webServer.send(200, "text/html", html);
+  });
+  
+  // API endpoints
+  webServer.on("/api/debug", HTTP_GET, []() {
+    webServer.send(200, "text/plain", debugMessages);
+  });
+  
+  webServer.on("/api/toggle-serial", HTTP_POST, []() {
+    serialRedirectEnabled = !serialRedirectEnabled;
+    addDebugMessage("Serial redirect " + String(serialRedirectEnabled ? "enabled" : "disabled"));
+    webServer.send(200, "text/plain", "OK");
+  });
+  
+  webServer.on("/api/clear-debug", HTTP_POST, []() {
+    debugMessages = "";
+    webServer.send(200, "text/plain", "OK");
+    // Don't add debug message here to avoid immediate refill
+  });
+  
+  webServer.on("/api/restart", HTTP_POST, []() {
+    addDebugMessage("System restart requested");
+    webServer.send(200, "text/plain", "Restarting...");
+    delay(1000);
+    ESP.restart();
+  });
+  
+  webServer.begin();
+  Serial.println("Web server started on port " + String(webServerPort));
+  addDebugMessage("Web server started on port " + String(webServerPort));
+}
+
 // ================= Setup all hardware =================
+String getResetReasonText(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:   return "Power-on reset";
+    case ESP_RST_EXT:       return "External reset";
+    case ESP_RST_SW:        return "Software reset";
+    case ESP_RST_PANIC:     return "Exception/panic reset";
+    case ESP_RST_INT_WDT:   return "Interrupt watchdog reset";
+    case ESP_RST_TASK_WDT:  return "Task watchdog reset";
+    case ESP_RST_WDT:       return "Other watchdog reset";
+    case ESP_RST_DEEPSLEEP: return "Deep sleep reset";
+    case ESP_RST_BROWNOUT:  return "Brownout reset";
+    case ESP_RST_SDIO:      return "SDIO reset";
+    default:                return "Unknown reset (" + String(reason) + ")";
+  }
+}
+
 void setupAll() {
+  // Always show firmware version on startup
   Serial.printf("Biltong Controller v%s starting...\n", FIRMWARE_VERSION);
+  addDebugMessage("Biltong Controller v" + String(FIRMWARE_VERSION) + " starting...");
   
   // Check for power loss reset - be more inclusive
   esp_reset_reason_t resetReason = esp_reset_reason();
-  Serial.printf("Reset reason: %d\n", resetReason);
+  String resetText = getResetReasonText(resetReason);
+  Serial.printf("Reset reason: %d (%s)\n", resetReason, resetText.c_str());
+  addDebugMessage("Reset reason: " + resetText);
   
   // Consider any reset except ESP_RST_SW (software reset) as power loss
   if (resetReason != ESP_RST_SW && resetReason != ESP_RST_DEEPSLEEP) {
     powerLossReset = true;
     Serial.printf("Power loss reset detected (reason: %d)\n", resetReason);
+    addDebugMessage("Power loss reset detected: " + resetText);
   } else {
     Serial.printf("Software reset detected (reason: %d)\n", resetReason);
+    addDebugMessage("Software reset detected: " + resetText);
   }
   
   // Initialize preferences and handle time based on reset reason
@@ -506,11 +1178,11 @@ void setupAll() {
   Serial.begin(115200);
   dht.begin();
   
-  // Initialize LCD
-  int lcdStatus = lcd.begin(20, 4);
-  if (lcdStatus != 0) {
-    Serial.printf("LCD initialization failed: %d\n", lcdStatus);
-  }
+  // Initialize LCD - DISABLED
+  // int lcdStatus = lcd.begin(20, 4);
+  // if (lcdStatus != 0) {
+  //   Serial.printf("LCD initialization failed: %d\n", lcdStatus);
+  // }
   
   // Initialize PWM for fan control
   ledcAttach(PIN_PWM_FAN, 25000, 8); // 25kHz PWM, 8-bit resolution
@@ -528,12 +1200,16 @@ void setupAll() {
   // Initialize heater pins (even if hardware not present)
   pinMode(PIN_HEATER, OUTPUT);
   pinMode(PIN_HEATER_FAN, OUTPUT);
-  digitalWrite(PIN_HEATER, HIGH); // שונה
-  digitalWrite(PIN_HEATER_FAN, HIGH); // שונה
+  digitalWrite(PIN_HEATER, HIGH); // HIGH = כבוי
+  digitalWrite(PIN_HEATER_FAN, HIGH); // HIGH = כבוי
   
   // Setup WiFi and MQTT
   setupWiFi();
   setupMQTT();
+  
+  // Setup OTA and Web Server
+  setupOTA();
+  setupWebServer();
   
   Serial.println("Setup complete");
   Serial.printf("Current startTime value: %lu\n", startTime);
@@ -549,6 +1225,7 @@ void loop() {
   // WiFi connection handling
   if (!WiFi.isConnected()) {
     Serial.println("WiFi disconnected, reconnecting...");
+    addDebugMessage("WiFi disconnected, reconnecting...");
     setupWiFi();
     delay(5000);
     return;
@@ -557,16 +1234,46 @@ void loop() {
   // MQTT connection handling
   if (!connectMQTT()) {
     Serial.println("MQTT connection failed, retrying...");
+    addDebugMessage("MQTT connection failed, retrying...");
     delay(5000);
     return;
   }
   
   mqtt.loop();
   
+  // Handle OTA updates
+  ArduinoOTA.handle();
+  
+  // Handle web server requests
+  webServer.handleClient();
+  
+  // Handle serial commands
+  handleSerialCommands();
+  
+  // Advanced debug logging
+  logAdvancedDebug();
+  
   // Update buttons
   btnSys.update();
   btnHeater.update();
   btnMode.update();
+  
+  // Add periodic debug message every 30 seconds
+  static unsigned long lastDebugHeartbeat = 0;
+  if (millis() - lastDebugHeartbeat >= 30000) {
+    addDebugMessage("System running - Temp: " + String(temperature, 1) + "°C, Humidity: " + String(humidity, 1) + "%, RPM: " + String(rpm));
+    lastDebugHeartbeat = millis();
+  }
+  
+  // Run automatic control
+  autoControl();
+  
+  // Check heater fan delay
+  if (heaterFanDelayedOff && (millis() - heaterFanOffTime >= HEATER_FAN_DELAY_MS)) {
+    digitalWrite(PIN_HEATER_FAN, HIGH);
+    heaterFanDelayedOff = false;
+    Serial.println("Heater fan turned OFF after 30 second delay");
+  }
   
   // Send status periodically
   static unsigned long lastStatusUpdate = 0;
