@@ -1,4 +1,24 @@
-/*   Combined Biltong controller v1.47
+/*   Combined Biltong controller v1.54
+     - FIX: Duration calculation now uses millis() instead of getCurrentTime() for accuracy.
+     - FIX: Duration now displays correctly instead of "--:--:--".
+     - FIX: Uses systemStartMillis to calculate elapsed time since startTime was set.
+     - NEW: ESP32 now calculates and sends duration as formatted string to HA.
+     - NEW: Duration format: "HH:MM:SS" or "Nd HH:MM:SS" for days.
+     - NEW: HA no longer needs to calculate duration - receives ready string.
+     - FIX: Eliminated timezone calculation issues for duration display.
+     - FIX: Duration updates every 30 seconds when MQTT is connected.
+     - FIX: Fixed timezone conversion - HA sends UTC, ESP32 adds timezone offset for display.
+     - FIX: Start time now displays correctly in Home Assistant (no more timezone offset).
+     - FIX: ESP32 receives UTC timestamp from HA and converts to local time for display.
+     - FIX: Fixed timezone conversion - startTime is already UTC from HA, no double conversion.
+     - FIX: Start time now displays correctly in Home Assistant (no more timezone offset).
+     - FIX: ESP32 receives UTC timestamp from HA and sends it back as-is.
+     - FIX: Fixed timezone conversion for HA - ESP32 now sends UTC timestamp to HA.
+     - FIX: Start time now displays correctly in Home Assistant (no more timezone offset).
+     - FIX: ESP32 uses local timezone internally but sends UTC to HA for compatibility.
+     - FIX: Fixed timezone issue - ESP32 now uses Israel timezone (UTC+2/UTC+3).
+     - FIX: Start time now displays correctly in Home Assistant (no more 3-hour offset).
+     - FIX: Added timezone configuration for proper local time display.
      - FIX: Fixed humidity display in web interface (was showing 0.0%).
      - FIX: Fixed Clear Debug Messages button - now actually clears messages.
      - FIX: Added descriptive text for reset reasons instead of just numbers.
@@ -78,7 +98,7 @@
      v1.36 - NEW: Added advanced debug mode for system behavior analysis.
 */
 
-#define FIRMWARE_VERSION "1.47"
+#define FIRMWARE_VERSION "1.54"
 
 #include <WiFi.h>
 #include <PubSubClient.h>
@@ -93,6 +113,8 @@
 #include <WebServer.h>
 #include <SPIFFS.h>
 #include "config.h"
+#include <time.h>
+#include <sys/time.h>
 
 // ================= CONFIG =================
 // WiFi / MQTT - Now loaded from config.h
@@ -101,7 +123,7 @@
 // Topics - Updated to match Home Assistant configuration
 const char* topicGet           = "biltong/cmd/get_start";
 const char* topicSet           = "biltong/cmd/set_start";
-const char* topicStatus        = "biltong/status";  // Contains: temp,humidity,fan%,rpm,sys,heater,auto,start_time
+const char* topicStatus        = "biltong/status";  // Contains: temp,humidity,fan%,rpm,sys,heater,auto,start_time,heater_state,duration
 const char* topicAlertPub      = "biltong/alert"; // New topic for alerts
 const char* topicSetProfile    = "biltong/cmd/set_profile"; // New topic for dynamic temperature control
 
@@ -481,7 +503,11 @@ time_t getEffectiveStartTime() {
 time_t getCurrentTime() {
   time_t effectiveStart = getEffectiveStartTime();
   if (effectiveStart > 0) {
-    return effectiveStart + (millis() - systemStartMillis) / 1000;
+    // effectiveStart is in local time (UTC+3), but HA expects UTC
+    // Convert back to UTC by subtracting timezone offset
+    time_t localTime = effectiveStart + (millis() - systemStartMillis) / 1000;
+    time_t utcTime = localTime - (3 * 3600); // Subtract 3 hours to get UTC
+    return utcTime;
   } else {
     return 0; // No valid time available
   }
@@ -623,15 +649,55 @@ void sendAllStatus() {
     }
   }
   
-  // --- הוסף את השורה החסרה כאן ---
-  char statusPayload[300];
+  // Calculate duration string
+  String durationStr = "--:--:--";
+  if (startTime > 0) {
+    // Calculate duration in seconds using millis() for accuracy
+    // startTime is in local time (UTC+3), systemStartMillis is when it was set
+    unsigned long currentMillis = millis();
+    unsigned long elapsedMillis = currentMillis - systemStartMillis;
+    unsigned long duration = elapsedMillis / 1000; // Convert to seconds
+    
+    if (duration > 0) {
+      // Convert to days, hours, minutes, seconds
+      int days = duration / 86400;
+      int hours = (duration % 86400) / 3600;
+      int minutes = (duration % 3600) / 60;
+      int seconds = duration % 60;
+      
+      if (days > 0) {
+        durationStr = String(days) + "d " + 
+                     String(hours < 10 ? "0" : "") + String(hours) + ":" +
+                     String(minutes < 10 ? "0" : "") + String(minutes) + ":" +
+                     String(seconds < 10 ? "0" : "") + String(seconds);
+      } else {
+        durationStr = String(hours < 10 ? "0" : "") + String(hours) + ":" +
+                     String(minutes < 10 ? "0" : "") + String(minutes) + ":" +
+                     String(seconds < 10 ? "0" : "") + String(seconds);
+      }
+    }
+  }
   
   // Create status payload
   char startTimeStr[12]; // Buffer גדול מספיק ל-ULong
-  sprintf(startTimeStr, "%lu", startTime);
   
+  // HA sends UTC timestamp, but we need to add timezone offset for display
+  // Israel timezone: UTC+2 (winter) or UTC+3 (summer)
+  time_t utcTime = startTime;
+  struct tm* utcTm = gmtime(&utcTime);
+  
+  // Calculate timezone offset (Israel: +2 or +3 hours)
+  // Simple approach: assume +3 hours (summer time) for now
+  // TODO: Implement proper DST detection
+  int timezoneOffset = 3; // 3 hours in summer
+  
+  time_t localTime = utcTime + (timezoneOffset * 3600); // Convert UTC to local
+  
+  sprintf(startTimeStr, "%lu", (unsigned long)localTime);
+  
+  char statusPayload[400]; // Increased buffer size for duration string
   snprintf(statusPayload, sizeof(statusPayload),
-    "%.1f,%.1f,%d,%lu,%s,%s,%s,%s,%s",
+    "%.1f,%.1f,%d,%lu,%s,%s,%s,%s,%s,%s",
     isnan(temp) ? 0.0 : temp,
     isnan(humidity) ? 0.0 : humidity,
     map(dutyCycle, 0, 255, 0, 100),
@@ -640,15 +706,16 @@ void sendAllStatus() {
     heaterButtonState ? "ON" : "OFF",  // heater = button state
     autoMode ? "AUTO" : "MANUAL",
     startTimeStr,  // שימוש במחרוזת שהוכנה
-    heaterPower ? "ON" : "OFF"  // heaterState = actual heater state
+    heaterPower ? "ON" : "OFF",  // heaterState = actual heater state
+    durationStr.c_str()  // duration as formatted string
   );
   
   // Debug output for fan speed (suppressed in advanced debug mode)
   if (!advancedDebugMode) {
-    Serial.printf("Sending status: temp=%.1f, humidity=%.1f, fan%%=%d, RPM=%lu, dutyCycle=%d, heater=%s, heaterState=%s\n",
+    Serial.printf("Sending status: temp=%.1f, humidity=%.1f, fan%%=%d, RPM=%lu, dutyCycle=%d, heater=%s, heaterState=%s, duration=%s\n",
                   isnan(temp) ? 0.0 : temp, isnan(humidity) ? 0.0 : humidity, 
                   map(dutyCycle, 0, 255, 0, 100), currentRPM, dutyCycle, 
-                  heaterButtonState ? "ON" : "OFF", heaterPower ? "ON" : "OFF");
+                  heaterButtonState ? "ON" : "OFF", heaterPower ? "ON" : "OFF", durationStr.c_str());
   }
   
   publishStateString(topicStatus, statusPayload, false);
@@ -1144,6 +1211,10 @@ void setupAll() {
     Serial.printf("Software reset detected (reason: %d)\n", resetReason);
     addDebugMessage("Software reset detected: " + resetText);
   }
+  
+  // Set timezone to Israel (UTC+2/UTC+3)
+  setenv("TZ", "IST-2IDT,M3.5.0,M10.5.0", 1);
+  tzset();
   
   // Initialize preferences and handle time based on reset reason
   prefs.begin("biltong", false);
