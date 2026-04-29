@@ -121,8 +121,9 @@
      v1.64 - NEW: HX711 calibration mode (zero + known weight) via MQTT/Web UI; saved to Preferences (hxOffset/hxScale).
 */
 
-#define FIRMWARE_VERSION "1.64"
+#define FIRMWARE_VERSION "1.66"
 
+#include <Arduino.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <Preferences.h>
@@ -139,6 +140,8 @@
 #include "config.h"
 #include <time.h>
 #include <sys/time.h>
+#include <driver/ledc.h>
+
 
 // ================= CONFIG =================
 // WiFi / MQTT - Now loaded from config.h
@@ -294,6 +297,7 @@ void sendAllStatus();
 void handleSerialCommands();
 void printControlTable();
 void logAdvancedDebug();
+void addDebugMessage(String message);  // שינוי לטובת visual studio code
 
 // ================= Test Mode Functions =================
 void handleSerialCommands() {
@@ -1501,8 +1505,13 @@ void setupAll() {
   // }
   
   // Initialize PWM for fan control
-  ledcAttach(PIN_PWM_FAN, 25000, 8); // 25kHz PWM, 8-bit resolution
+  // ledcAttach(PIN_PWM_FAN, 25000, 8); // 25kHz PWM, 8-bit resolution // change to support the CPP
+  ledcSetup(0, 25000, 8);           // channel 0, 25kHz, 8-bit resolution
+  ledcAttachPin(PIN_PWM_FAN, 0);   // חיבר את PIN_PWM_FAN ל‑channel 0
+
+
   setMainFanSpeed(FAN_DUTY_MIN);
+  
   
   // Initialize buttons
   btnSys.begin();
@@ -1538,6 +1547,13 @@ void setup() {
  
 // ================= Main loop =================
 void loop() {
+
+   // Handle OTA updates
+  ArduinoOTA.handle();
+  
+  // Handle web server requests
+  webServer.handleClient();
+
   // WiFi connection handling
   if (!WiFi.isConnected()) {
     Serial.println("WiFi disconnected, reconnecting...");
@@ -1557,11 +1573,6 @@ void loop() {
   
   mqtt.loop();
   
-  // Handle OTA updates
-  ArduinoOTA.handle();
-  
-  // Handle web server requests
-  webServer.handleClient();
   
   // Handle serial commands
   handleSerialCommands();
