@@ -119,9 +119,21 @@
      v1.62 - FIX: WEIGHT_SCALE_FACTOR = 1.24 (after tare get_units ~1280 for 1584g). Zero zone for stable empty display.
      v1.63 - WEIGHT_SCALE_FACTOR = 1.28 (1584 was 1733). Fast EMA when rise > 150g for fewer readings to settle.
      v1.64 - NEW: HX711 calibration mode (zero + known weight) via MQTT/Web UI; saved to Preferences (hxOffset/hxScale).
+     v1.67 - FIX: Symmetric fast-tracking filter for both weight add/remove; improved return-to-zero behavior.
+     v1.67 - NEW: Calibration sanity warning on boot when saved scale/offset looks invalid.
+     v1.68 - NEW: Auto-rezero when stable large negative drift is detected after unload.
+     v1.68 - FIX: Display clamps negative weight to 0 g (physical floor).
+     v1.69 - NEW: Large-step confirmation filter prevents single-sample spikes on empty scale.
+     v1.70 - NEW: Auto-zero for stable positive empty drift (not only negative drift).
+     v1.71 - FIX: Auto-rezero now uses scale.tare() for cleaner re-zero; wider zero threshold to suppress post-rezero jitter.
+     v1.72 - NEW: Median pre-filter + raw glitch guard for HX711 spikes; tighter positive auto-rezero conditions.
+     v1.73 - FIX: step_hold state no longer sticks between cycles.
+     v1.73 - NEW: Hard empty clamp with automatic release on confirmed load increase.
+     v1.74 - FIX: Reset step confirmation state during empty-clamp/release; improved empty auto-rezero for 200-250g drift.
+     v1.75 - NEW: Adaptive empty auto-tare for stable raw up to 700g; fast release on real load.
 */
 
-#define FIRMWARE_VERSION "1.66"
+#define FIRMWARE_VERSION "1.75"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -183,13 +195,29 @@ const int PIN_HX_DOUT       = 14; // HX711 DT pin
 const int PIN_HX_SCK        = 25; // HX711 SCK pin
 // Weight smoothing: EMA alpha (higher = smoother). Outlier = only on sudden DROP (noise spike).
 const float WEIGHT_EMA_ALPHA     = 0.88f;   // when stable or small change
-const float WEIGHT_EMA_ALPHA_FAST = 0.50f; // when big increase (weight added) — fewer readings to settle
-const float WEIGHT_RISE_FAST_G   = 150.0f; // if (raw - currentWeight) > this, use ALPHA_FAST
+const float WEIGHT_EMA_ALPHA_FAST = 0.35f; // when big change (add/remove) — fewer readings to settle
+const float WEIGHT_FAST_TRACK_G  = 80.0f;  // if |raw-currentWeight| > this, use ALPHA_FAST
+const float WEIGHT_STEP_CONFIRM_G = 220.0f; // big step must persist before applying (spike rejection)
+const int   WEIGHT_STEP_CONFIRM_SAMPLES = 3; // consecutive samples required for big step
 const float WEIGHT_OUTLIER_G    = 120.0f;  // if (currentWeight - raw) > this → slow blend (reject drop spike)
 const int   WEIGHT_SAMPLES      = 15;      // HX711 samples (fewer = faster, less chance of loop blocking)
 // IMPORTANT: keep this at 1.0. Use calibration (hxOffset/hxScale) instead of a fudge factor.
 const float WEIGHT_SCALE_FACTOR = 1.0f;
-const float WEIGHT_ZERO_THRESHOLD = 45.0f; // display 0 when |weight| < this (stable reading when empty)
+const float WEIGHT_ZERO_THRESHOLD = 60.0f; // display 0 when |weight| < this (stable reading when empty)
+const float WEIGHT_CALIB_SANITY_G = 300.0f; // empty-at-boot above this means saved calibration likely invalid
+const float WEIGHT_AUTO_REZERO_TRIGGER_G = -180.0f; // if smoothed weight below this, consider rezero
+const float WEIGHT_AUTO_REZERO_STABLE_DELTA_G = 120.0f; // allow noisier empty readings
+const unsigned long WEIGHT_AUTO_REZERO_HOLD_MS = 8000UL; // hold negative for 8s before rezero
+const bool WEIGHT_AUTO_REZERO_ON_BAD_BOOT = true; // if boot sanity fails, auto tare once
+const float WEIGHT_EMPTY_REZERO_TRIGGER_G = 80.0f; // if empty appears > this, consider positive drift rezero
+const float WEIGHT_EMPTY_REZERO_RAW_MAX_G = 700.0f; // adaptive: allow stable empty drift up to 700g
+const float WEIGHT_EMPTY_REZERO_STABLE_DELTA_G = 30.0f; // require low movement before auto-rezero
+const unsigned long WEIGHT_EMPTY_REZERO_HOLD_MS = 10000UL; // stable positive drift duration
+const float WEIGHT_RAW_MIN_VALID_G = -350.0f; // reject impossible negative spikes
+const float WEIGHT_RAW_MAX_VALID_G = 6000.0f; // reject impossible high spikes
+const float WEIGHT_EMPTY_CLAMP_MAX_RAW_G = 700.0f; // likely empty if raw below this
+const float WEIGHT_EMPTY_CLAMP_RELEASE_G = 900.0f; // release clamp when raw rises above this
+const unsigned long WEIGHT_EMPTY_CLAMP_HOLD_MS = 8000UL; // how long empty must be stable before clamp
 // const int PIN_PWM_LED       = 17; // FUTURE: PWM pin for LED MOSFET control
 
 // Buttons
@@ -238,6 +266,35 @@ float humidity = 0.0;
 int rpm = 0;
 float currentWeight = 0.0;       // smoothed weight (EMA + outlier rejection)
 bool weightFirstReading = true;  // true until first raw reading applied (for init after tare)
+// Weight diagnostics for Web debug log (used to tune stability)
+float lastWeightRaw = 0.0f;
+float lastWeightDelta = 0.0f;
+float lastWeightAlpha = 0.0f;
+String lastWeightFilterMode = "init";
+unsigned long negativeDriftStartMs = 0;
+unsigned long positiveDriftStartMs = 0;
+unsigned long emptyClampStartMs = 0;
+bool emptyClampActive = false;
+int weightStepConfirmCount = 0;
+float weightStepPendingRaw = 0.0f;
+float weightRawHistory[5] = {0, 0, 0, 0, 0};
+int weightRawHistoryCount = 0;
+int weightRawHistoryIndex = 0;
+
+float median5(float* values, int n) {
+  float tmp[5];
+  for (int i = 0; i < n; i++) tmp[i] = values[i];
+  for (int i = 0; i < n - 1; i++) {
+    for (int j = i + 1; j < n; j++) {
+      if (tmp[j] < tmp[i]) {
+        float t = tmp[i];
+        tmp[i] = tmp[j];
+        tmp[j] = t;
+      }
+    }
+  }
+  return tmp[n / 2];
+}
 
 // New: Fan speed presets
 const int FAN_SPEED_MIN    = 400; // RPM - for reference
@@ -647,6 +704,7 @@ void autoControl() {
 
 // Weight for display/MQTT: 0 when near zero to avoid drift when scale is empty
 float getDisplayWeight() {
+  if (currentWeight < 0.0f) return 0.0f;
   return (fabsf(currentWeight) < WEIGHT_ZERO_THRESHOLD) ? 0.0f : currentWeight;
 }
 
@@ -1491,6 +1549,17 @@ void setupAll() {
   if (hxCalLoaded) {
     scale.set_offset(hxOffset);
     addDebugMessage("Load cell (HX711) initialized with saved calibration (scale/offset)");
+    float sanityWeight = scale.get_units(10);
+    if (fabsf(sanityWeight) > WEIGHT_CALIB_SANITY_G) {
+      addDebugMessage("WARNING: saved HX711 calibration may be invalid for current setup. Empty reading=" +
+                      String(sanityWeight, 1) + " g. Run Calibrate ZERO then Calibrate WEIGHT.");
+      if (WEIGHT_AUTO_REZERO_ON_BAD_BOOT) {
+        scale.tare();
+        hxOffset = scale.get_offset();
+        saveHxOffsetScale();
+        addDebugMessage("Auto-rezero on boot applied (tare due to sanity warning). New offset=" + String(hxOffset));
+      }
+    }
   } else {
     scale.tare();
     hxOffset = scale.get_offset();
@@ -1587,19 +1656,141 @@ void loop() {
   
   // Update weight in main loop (often) so EMA converges quickly when user adds load
   if (scale.is_ready()) {
-    float raw = scale.get_units(WEIGHT_SAMPLES) * WEIGHT_SCALE_FACTOR;
-    if (weightFirstReading) {
-      currentWeight = raw;
-      weightFirstReading = false;
+    float rawSample = scale.get_units(WEIGHT_SAMPLES) * WEIGHT_SCALE_FACTOR;
+
+    // Reject clearly invalid spikes before any filtering
+    if (rawSample < WEIGHT_RAW_MIN_VALID_G || rawSample > WEIGHT_RAW_MAX_VALID_G) {
+      lastWeightFilterMode = "raw_glitch";
+      lastWeightRaw = rawSample;
+      lastWeightDelta = 0.0f;
+      lastWeightAlpha = 0.0f;
+      weightStepConfirmCount = 0;
     } else {
-      float drop = currentWeight - raw;
-      if (drop > WEIGHT_OUTLIER_G) {
-        currentWeight = 0.97f * currentWeight + 0.03f * raw;
+      // Median pre-filter (window up to 5) for robust anti-spike raw
+      weightRawHistory[weightRawHistoryIndex] = rawSample;
+      weightRawHistoryIndex = (weightRawHistoryIndex + 1) % 5;
+      if (weightRawHistoryCount < 5) weightRawHistoryCount++;
+      float raw = median5(weightRawHistory, weightRawHistoryCount);
+      lastWeightRaw = raw;
+      if (weightFirstReading) {
+        lastWeightDelta = 0.0f;
+        lastWeightAlpha = 0.0f;
+        lastWeightFilterMode = "first_reading";
+        currentWeight = raw;
+        weightFirstReading = false;
       } else {
-        // Big increase (weight added): use fast alpha so we settle in few readings
-        float rise = raw - currentWeight;
-        float alpha = (rise > WEIGHT_RISE_FAST_G) ? WEIGHT_EMA_ALPHA_FAST : WEIGHT_EMA_ALPHA;
-        currentWeight = alpha * currentWeight + (1.0f - alpha) * raw;
+        float prev = currentWeight;
+        float effectiveRaw = raw;
+        float delta = raw - currentWeight;
+        float absDelta = fabsf(delta);
+        bool stepHeldThisCycle = false;
+
+      // Reject one-off large jumps (common when empty scale gets EMI/mechanical spike)
+      if (absDelta > WEIGHT_STEP_CONFIRM_G) {
+        if (weightStepConfirmCount == 0 || fabsf(raw - weightStepPendingRaw) < WEIGHT_STEP_CONFIRM_G * 0.6f) {
+          weightStepPendingRaw = raw;
+          weightStepConfirmCount++;
+        } else {
+          weightStepPendingRaw = raw;
+          weightStepConfirmCount = 1;
+        }
+
+        if (weightStepConfirmCount < WEIGHT_STEP_CONFIRM_SAMPLES) {
+          effectiveRaw = currentWeight; // hold value until step confirmed
+          lastWeightFilterMode = "step_hold";
+          stepHeldThisCycle = true;
+        } else {
+          // confirmed large step; allow transition
+          effectiveRaw = raw;
+          weightStepConfirmCount = 0;
+        }
+      } else {
+        weightStepConfirmCount = 0;
+      }
+
+        delta = effectiveRaw - currentWeight;
+        absDelta = fabsf(delta);
+        float alpha = (absDelta > WEIGHT_FAST_TRACK_G) ? WEIGHT_EMA_ALPHA_FAST : WEIGHT_EMA_ALPHA;
+        if (!stepHeldThisCycle) {
+          lastWeightFilterMode = (absDelta > WEIGHT_FAST_TRACK_G) ? "fast_track" : "normal_ema";
+        }
+        lastWeightAlpha = alpha;
+        currentWeight = alpha * currentWeight + (1.0f - alpha) * effectiveRaw;
+
+      // Zero-lock to avoid long drift tails when scale is empty
+        if (fabsf(raw) < WEIGHT_ZERO_THRESHOLD && fabsf(currentWeight) < WEIGHT_ZERO_THRESHOLD) {
+          currentWeight = 0.0f;
+          lastWeightFilterMode = "zero_lock";
+        }
+        lastWeightDelta = effectiveRaw - prev;
+      }
+
+      // Auto-rezero for persistent stable negative drift (common after unload/creep)
+      if (currentWeight < WEIGHT_AUTO_REZERO_TRIGGER_G && fabsf(lastWeightDelta) < WEIGHT_AUTO_REZERO_STABLE_DELTA_G) {
+        if (negativeDriftStartMs == 0) {
+          negativeDriftStartMs = millis();
+        } else if (millis() - negativeDriftStartMs >= WEIGHT_AUTO_REZERO_HOLD_MS) {
+          scale.tare();
+          hxOffset = scale.get_offset();
+          saveHxOffsetScale();
+          currentWeight = 0.0f;
+          weightFirstReading = true;
+          negativeDriftStartMs = 0;
+          addDebugMessage("Auto-rezero applied due to stable negative drift. New offset=" + String(hxOffset));
+        }
+      } else {
+        negativeDriftStartMs = 0;
+      }
+
+    // Auto-rezero for stable positive drift while likely empty (raw stays in low-empty range)
+      if (currentWeight > WEIGHT_EMPTY_REZERO_TRIGGER_G &&
+          currentWeight < WEIGHT_EMPTY_REZERO_RAW_MAX_G &&
+          fabsf(raw) < WEIGHT_EMPTY_REZERO_RAW_MAX_G &&
+          fabsf(lastWeightDelta) < WEIGHT_EMPTY_REZERO_STABLE_DELTA_G &&
+          lastWeightFilterMode != "step_hold" &&
+          lastWeightFilterMode != "fast_track") {
+        if (positiveDriftStartMs == 0) {
+          positiveDriftStartMs = millis();
+        } else if (millis() - positiveDriftStartMs >= WEIGHT_EMPTY_REZERO_HOLD_MS) {
+          scale.tare();
+          hxOffset = scale.get_offset();
+          saveHxOffsetScale();
+          currentWeight = 0.0f;
+          weightFirstReading = true;
+          positiveDriftStartMs = 0;
+          addDebugMessage("Auto-rezero applied due to stable positive empty drift. New offset=" + String(hxOffset));
+        }
+      } else {
+        positiveDriftStartMs = 0;
+      }
+
+      // Hard empty clamp: if likely empty is stable long enough, force 0 until confirmed load increase
+      if (!emptyClampActive) {
+        if (fabsf(raw) < WEIGHT_EMPTY_CLAMP_MAX_RAW_G &&
+            fabsf(lastWeightDelta) < WEIGHT_EMPTY_REZERO_STABLE_DELTA_G &&
+            lastWeightFilterMode != "fast_track" &&
+            lastWeightFilterMode != "step_hold") {
+          if (emptyClampStartMs == 0) {
+            emptyClampStartMs = millis();
+          } else if (millis() - emptyClampStartMs >= WEIGHT_EMPTY_CLAMP_HOLD_MS) {
+            emptyClampActive = true;
+            weightStepConfirmCount = 0;
+            currentWeight = 0.0f;
+            lastWeightFilterMode = "empty_clamp";
+          }
+        } else {
+          emptyClampStartMs = 0;
+        }
+      } else {
+        currentWeight = 0.0f;
+        // Release clamp immediately on clear load increase
+        if (raw > WEIGHT_EMPTY_CLAMP_RELEASE_G) {
+          emptyClampActive = false;
+          emptyClampStartMs = 0;
+          weightStepConfirmCount = 0;
+          weightFirstReading = true;
+          lastWeightFilterMode = "empty_clamp_release";
+        }
       }
     }
   }
@@ -1608,6 +1799,14 @@ void loop() {
   static unsigned long lastDebugHeartbeat = 0;
   if (millis() - lastDebugHeartbeat >= 30000) {
     addDebugMessage("System running - Temp: " + String(temperature, 1) + "°C, Humidity: " + String(humidity, 1) + "%, RPM: " + String(rpm) + ", Weight: " + String(getDisplayWeight(), 1) + " g");
+    addDebugMessage("Weight dbg - raw: " + String(lastWeightRaw, 1) +
+                    " g, smooth: " + String(currentWeight, 1) +
+                    " g, shown: " + String(getDisplayWeight(), 1) +
+                    " g, delta: " + String(lastWeightDelta, 1) +
+                    " g, alpha: " + String(lastWeightAlpha, 2) +
+                    ", mode: " + lastWeightFilterMode +
+                    ", hxScale: " + String(hxScale, 6) +
+                    ", hxOffset: " + String(hxOffset));
     lastDebugHeartbeat = millis();
   }
   
